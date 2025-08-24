@@ -240,12 +240,6 @@ MIT License - see LICENSE file for details.
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/yourusername/ai-presentation-generator/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/ai-presentation-generator/discussions)
-- **Email**: support@yourapp.com
-
 ## 🎉 Acknowledgments
 
 - Built with Express.js and modern web technologies
@@ -253,5 +247,3 @@ MIT License - see LICENSE file for details.
 - PowerPoint file format based on Open XML standards
 
 ---
-
-Made with ❤️ for better presentations
