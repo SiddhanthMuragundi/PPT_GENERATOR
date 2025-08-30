@@ -1,4 +1,4 @@
-// server.js - Simple backend for AI Presentation Generator with AIPipe support
+// server.js - Simple backend for AI Presentation Generator
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
@@ -71,7 +71,7 @@ const providers = {
     }
   },
   gemini: {
-    url: (apiKey) => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+    url: (apiKey) => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, // Using gemini-pro (stable and available)
     headers: () => ({
       'Content-Type': 'application/json'
     }),
@@ -91,25 +91,6 @@ const providers = {
         return data.candidates[0].content.parts[0].text;
       }
       throw new Error('Invalid Gemini response format');
-    }
-  },
-  aipipe: {
-    url: 'https://aipipe.org/openai/v1/chat/completions',
-    headers: (apiKey) => ({
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    }),
-    body: (prompt) => ({
-      model: 'gpt-4o-mini', // Using a reliable OpenAI model through AIPipe
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      max_tokens: 4000
-    }),
-    extractResponse: (data) => {
-      if (data.choices && data.choices[0] && data.choices[0].message) {
-        return data.choices[0].message.content;
-      }
-      throw new Error('Invalid AIPipe response format');
     }
   }
 };
@@ -279,7 +260,354 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
+// Function to read and extract information from PPTX template
+async function readPPTXTemplate(templateBuffer) {
+  try {
+    const zip = new JSZip();
+    const contents = await zip.loadAsync(templateBuffer);
+    
+    // Initialize template info object
+    const templateInfo = {
+      titleStyle: null,
+      contentStyle: null,
+      background: null,
+      colorScheme: null,
+      masterSlide: null
+    };
+    
+    // Read theme colors from theme1.xml
+    try {
+      const themeFile = contents.files['ppt/theme/theme1.xml'];
+      if (themeFile) {
+        const themeXml = await themeFile.async('text');
+        const colorScheme = extractColorScheme(themeXml);
+        templateInfo.colorScheme = colorScheme;
+        console.log('Extracted color scheme:', colorScheme);
+      }
+    } catch (error) {
+      console.log('Could not read theme colors:', error.message);
+    }
+    
+    // Read slide master for layout information
+    try {
+      const masterFile = contents.files['ppt/slideMasters/slideMaster1.xml'];
+      if (masterFile) {
+        const masterXml = await masterFile.async('text');
+        const masterInfo = extractMasterSlideInfo(masterXml);
+        templateInfo.masterSlide = masterInfo;
+        console.log('Extracted master slide info');
+      }
+    } catch (error) {
+      console.log('Could not read slide master:', error.message);
+    }
+    
+    // Try to read the first slide for styling information
+    try {
+      const slideFile = contents.files['ppt/slides/slide1.xml'];
+      if (slideFile) {
+        const slideXml = await slideFile.async('text');
+        const slideInfo = extractSlideInfo(slideXml, templateInfo.colorScheme);
+        
+        if (slideInfo.titleStyle) {
+          templateInfo.titleStyle = slideInfo.titleStyle;
+        }
+        if (slideInfo.contentStyle) {
+          templateInfo.contentStyle = slideInfo.contentStyle;
+        }
+        if (slideInfo.background) {
+          templateInfo.background = slideInfo.background;
+        }
+        
+        console.log('Extracted slide styling information');
+      }
+    } catch (error) {
+      console.log('Could not read first slide:', error.message);
+    }
+    
+    // Set default styles based on extracted information
+    if (templateInfo.colorScheme && !templateInfo.titleStyle) {
+      templateInfo.titleStyle = {
+        fontSize: 28,
+        fontFace: 'Arial',
+        color: templateInfo.colorScheme.accent1 || '1F497D'
+      };
+    }
+    
+    if (templateInfo.colorScheme && !templateInfo.contentStyle) {
+      templateInfo.contentStyle = {
+        fontSize: 18,
+        fontFace: 'Arial',
+        color: templateInfo.colorScheme.text1 || '444444'
+      };
+    }
+    
+    return templateInfo;
+    
+  } catch (error) {
+    console.error('Error reading PPTX template:', error);
+    return null;
+  }
+}
+
+// Helper function to extract color scheme from theme XML
+function extractColorScheme(themeXml) {
+  const colorScheme = {};
+  
+  try {
+    // Simple regex patterns to extract common theme colors
+    const patterns = {
+      accent1: /<a:accent1[^>]*>[\s\S]*?<a:srgbClr val="([^"]*)"[\s\S]*?<\/a:accent1>/i,
+      accent2: /<a:accent2[^>]*>[\s\S]*?<a:srgbClr val="([^"]*)"[\s\S]*?<\/a:accent2>/i,
+      text1: /<a:dk1[^>]*>[\s\S]*?<a:srgbClr val="([^"]*)"[\s\S]*?<\/a:dk1>/i,
+      background1: /<a:lt1[^>]*>[\s\S]*?<a:srgbClr val="([^"]*)"[\s\S]*?<\/a:lt1>/i
+    };
+    
+    for (const [key, pattern] of Object.entries(patterns)) {
+      const match = themeXml.match(pattern);
+      if (match && match[1]) {
+        colorScheme[key] = match[1];
+      }
+    }
+    
+    // Fallback colors if extraction fails
+    if (!colorScheme.accent1) colorScheme.accent1 = '1F497D';
+    if (!colorScheme.text1) colorScheme.text1 = '444444';
+    if (!colorScheme.background1) colorScheme.background1 = 'FFFFFF';
+    
+  } catch (error) {
+    console.log('Error extracting color scheme:', error.message);
+    // Return default colors
+    return {
+      accent1: '1F497D',
+      text1: '444444',
+      background1: 'FFFFFF'
+    };
+  }
+  
+  return colorScheme;
+}
+
+// Helper function to extract master slide information
+function extractMasterSlideInfo(masterXml) {
+  // This is a simplified extraction - in a full implementation,
+  // you would parse the XML properly to extract layout information
+  return {
+    extracted: true,
+    hasCustomLayouts: masterXml.includes('<p:sldLayout')
+  };
+}
+
+// Helper function to extract slide information
+function extractSlideInfo(slideXml, colorScheme) {
+  const slideInfo = {
+    titleStyle: null,
+    contentStyle: null,
+    background: null
+  };
+  
+  try {
+    // Try to extract background information
+    if (slideXml.includes('<p:bg>')) {
+      const bgColorMatch = slideXml.match(/<a:srgbClr val="([^"]*)".*?>/);
+      if (bgColorMatch) {
+        slideInfo.background = {
+          type: 'color',
+          value: bgColorMatch[1]
+        };
+      }
+    }
+    
+    // Use color scheme for styling if available
+    if (colorScheme) {
+      slideInfo.titleStyle = {
+        fontSize: 28,
+        fontFace: 'Arial',
+        color: colorScheme.accent1
+      };
+      
+      slideInfo.contentStyle = {
+        fontSize: 18,
+        fontFace: 'Arial',
+        color: colorScheme.text1
+      };
+    }
+    
+  } catch (error) {
+    console.log('Error extracting slide info:', error.message);
+  }
+  
+  return slideInfo;
+}
+
+// Function to read template slides and extract their structure
+async function readTemplateSlides(templateBuffer) {
+  try {
+    const zip = new JSZip();
+    const contents = await zip.loadAsync(templateBuffer);
+    
+    const templateSlides = [];
+    
+    // Find all slide files
+    const slideFiles = Object.keys(contents.files).filter(name => 
+      name.startsWith('ppt/slides/slide') && name.endsWith('.xml')
+    );
+    
+    console.log(`Found ${slideFiles.length} slides in template`);
+    
+    for (const slideFileName of slideFiles) {
+      try {
+        const slideFile = contents.files[slideFileName];
+        const slideXml = await slideFile.async('text');
+        
+        // Extract slide information
+        const slideInfo = await extractSlideStructure(slideXml, contents);
+        if (slideInfo) {
+          templateSlides.push(slideInfo);
+        }
+      } catch (error) {
+        console.log(`Error reading slide ${slideFileName}:`, error.message);
+      }
+    }
+    
+    return templateSlides.length > 0 ? templateSlides : null;
+    
+  } catch (error) {
+    console.error('Error reading template slides:', error);
+    return null;
+  }
+}
+
+// Helper function to extract slide structure from XML
+async function extractSlideStructure(slideXml, zipContents) {
+  const slideInfo = {
+    background: null,
+    titlePlaceholder: null,
+    contentPlaceholder: null,
+    images: []
+  };
+  
+  try {
+    // Extract background information
+    const backgroundMatch = slideXml.match(/<p:bg>(.*?)<\/p:bg>/s);
+    if (backgroundMatch) {
+      const bgContent = backgroundMatch[1];
+      
+      // Check for solid color background
+      const colorMatch = bgContent.match(/<a:srgbClr val="([^"]*)".*?>/);
+      if (colorMatch) {
+        slideInfo.background = { color: colorMatch[1] };
+      }
+      
+      // Check for image background
+      const imageMatch = bgContent.match(/<a:blip r:embed="([^"]*)".*?>/);
+      if (imageMatch) {
+        slideInfo.background = { type: 'image', embed: imageMatch[1] };
+      }
+    }
+    
+    // Extract title placeholder position and formatting
+    const titleMatches = slideXml.match(/<p:sp[^>]*>.*?<p:nvSpPr>.*?<p:cNvPr[^>]*name="Title[^"]*".*?<\/p:sp>/s);
+    if (titleMatches) {
+      slideInfo.titlePlaceholder = extractPlaceholderInfo(titleMatches[0]);
+      slideInfo.titlePlaceholder.type = 'title';
+    }
+    
+    // Extract content placeholder
+    const contentMatches = slideXml.match(/<p:sp[^>]*>.*?<p:nvSpPr>.*?<p:cNvPr[^>]*name="Content Placeholder[^"]*".*?<\/p:sp>/s);
+    if (contentMatches) {
+      slideInfo.contentPlaceholder = extractPlaceholderInfo(contentMatches[0]);
+      slideInfo.contentPlaceholder.type = 'content';
+    }
+    
+    // If no specific content placeholder, look for text placeholders
+    if (!slideInfo.contentPlaceholder) {
+      const textMatches = slideXml.match(/<p:sp[^>]*>.*?<p:txBody>.*?<\/p:sp>/s);
+      if (textMatches) {
+        slideInfo.contentPlaceholder = extractPlaceholderInfo(textMatches[0]);
+        slideInfo.contentPlaceholder.type = 'text';
+      }
+    }
+    
+    // Set default positions if not found
+    if (!slideInfo.titlePlaceholder) {
+      slideInfo.titlePlaceholder = {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 28, fontFace: 'Arial', color: '1F497D'
+      };
+    }
+    
+    if (!slideInfo.contentPlaceholder) {
+      slideInfo.contentPlaceholder = {
+        x: 0.5, y: 2, w: 9, h: 4,
+        fontSize: 18, fontFace: 'Arial', color: '444444'
+      };
+    }
+    
+    return slideInfo;
+    
+  } catch (error) {
+    console.log('Error extracting slide structure:', error.message);
+    return null;
+  }
+}
+
+// Helper function to extract placeholder information from XML
+function extractPlaceholderInfo(xmlContent) {
+  const placeholder = {
+    x: 0.5, y: 0.5, w: 9, h: 1,
+    fontSize: 18, fontFace: 'Arial', color: '444444'
+  };
+  
+  try {
+    // Extract position information (simplified)
+    const transformMatch = xmlContent.match(/<a:xfrm>(.*?)<\/a:xfrm>/s);
+    if (transformMatch) {
+      const transform = transformMatch[1];
+      
+      // Extract offset (position)
+      const offsetMatch = transform.match(/<a:off x="([^"]*)" y="([^"]*)"/);
+      if (offsetMatch) {
+        // Convert EMU to inches (approximate)
+        placeholder.x = Math.round((parseInt(offsetMatch[1]) / 914400) * 100) / 100;
+        placeholder.y = Math.round((parseInt(offsetMatch[2]) / 914400) * 100) / 100;
+      }
+      
+      // Extract extent (size)
+      const extentMatch = transform.match(/<a:ext cx="([^"]*)" cy="([^"]*)"/);
+      if (extentMatch) {
+        // Convert EMU to inches (approximate)
+        placeholder.w = Math.round((parseInt(extentMatch[1]) / 914400) * 100) / 100;
+        placeholder.h = Math.round((parseInt(extentMatch[2]) / 914400) * 100) / 100;
+      }
+    }
+    
+    // Extract font information
+    const fontMatch = xmlContent.match(/<a:latin typeface="([^"]*)"/);
+    if (fontMatch) {
+      placeholder.fontFace = fontMatch[1];
+    }
+    
+    // Extract font size
+    const sizeMatch = xmlContent.match(/<a:rPr.*?sz="([^"]*)"/);
+    if (sizeMatch) {
+      placeholder.fontSize = Math.round(parseInt(sizeMatch[1]) / 100);
+    }
+    
+    // Extract color
+    const colorMatch = xmlContent.match(/<a:srgbClr val="([^"]*)"/);
+    if (colorMatch) {
+      placeholder.color = colorMatch[1];
+    }
+    
+  } catch (error) {
+    console.log('Error extracting placeholder info:', error.message);
+  }
+  
+  return placeholder;
+}
+
 // Generate PPTX from slides structure with optional template support
+// Generate PPTX from slides structure with template support
 async function generatePPTX(slidesStructure, templateFile = null) {
   
   if (templateFile && templateFile.buffer) {
@@ -471,6 +799,17 @@ async function extractTemplateTheme(templateBuffer) {
     console.error('Error extracting template theme:', error);
     return null;
   }
+}
+
+// Helper function to escape XML characters
+function escapeXml(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
 // Generate new presentation without template using pptxgenjs
