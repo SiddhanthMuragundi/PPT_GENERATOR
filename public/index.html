@@ -379,10 +379,6 @@
                         <input type="radio" id="gemini" name="provider" value="gemini">
                         <label for="gemini">Google (Gemini)</label>
                     </div>
-                    <div class="api-provider">
-                        <input type="radio" id="aipipe" name="provider" value="aipipe">
-                        <label for="aipipe">AI Pipe (OpenAI Models)</label>
-                    </div>
                 </div>
 
                 <div class="form-group">
@@ -609,6 +605,656 @@
             }
         }
 
+        async function analyzeContentWithAI(text, guidance, provider, apiKey) {
+            // Call our backend API instead of calling AI providers directly
+            const response = await fetch('/api/analyze', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    text: text,
+                    guidance: guidance,
+                    provider: provider,
+                    apiKey: apiKey
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.error || `Server error: ${response.status} ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            
+            if (!data.success) {
+                throw new Error(data.error || 'Failed to analyze content');
+            }
+
+            const slidesStructure = data.slides;
+            slidesData = slidesStructure;
+
+            // Show preview
+            showSlidesPreview(slidesStructure);
+            
+            return slidesStructure;
+        }
+
+        function showSlidesPreview(slidesStructure) {
+            const previewContainer = document.getElementById('previewContainer');
+            const slidesPreview = document.getElementById('slidesPreviews');
+            
+            slidesPreview.innerHTML = '';
+            
+            slidesStructure.slides.forEach((slide, index) => {
+                const slideDiv = document.createElement('div');
+                slideDiv.className = 'slide-preview';
+                slideDiv.innerHTML = `
+                    <div class="slide-title">Slide ${index + 1}: ${slide.title}</div>
+                    <div class="slide-content">
+                        ${Array.isArray(slide.content) 
+                            ? slide.content.map(point => `• ${point}`).join('<br>')
+                            : slide.content}
+                    </div>
+                `;
+                slidesPreview.appendChild(slideDiv);
+            });
+
+            previewContainer.style.display = 'block';
+        }
+
+        async function parseTemplate() {
+            if (!templateFile) return;
+
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = async function(e) {
+                    try {
+                        const zip = new JSZip();
+                        const zipContent = await zip.loadAsync(e.target.result);
+                        
+                        // Extract basic template information
+                        templateData = {
+                            hasTheme: zipContent.file('ppt/theme/theme1.xml') !== null,
+                            hasMaster: zipContent.file('ppt/slideMasters/slideMaster1.xml') !== null,
+                            slideLayoutsCount: Object.keys(zipContent.files).filter(name => 
+                                name.startsWith('ppt/slideLayouts/')).length
+                        };
+                        
+                        resolve(templateData);
+                    } catch (error) {
+                        reject(error);
+                    }
+                };
+                reader.onerror = () => reject(new Error('Failed to read template file'));
+                reader.readAsArrayBuffer(templateFile);
+            });
+        }
+
+        async function generatePPTX(slidesStructure) {
+            // Create a basic PPTX structure
+            const zip = new JSZip();
+            
+            // Add basic PPTX structure
+            addBasicPPTXStructure(zip, slidesStructure);
+            
+            // Generate and download
+            const blob = await zip.generateAsync({type: 'blob'});
+            const fileName = `${slidesStructure.presentationTitle || 'Generated-Presentation'}.pptx`;
+            saveAs(blob, fileName.replace(/[^a-zA-Z0-9-_]/g, '_'));
+        }
+
+        function addBasicPPTXStructure(zip, slidesStructure) {
+            // Content Types
+            zip.file('[Content_Types].xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+    <Default Extension="xml" ContentType="application/xml"/>
+    <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+    <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+    <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+    ${slidesStructure.slides.map((_, index) => 
+        `<Override PartName="/ppt/slides/slide${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`
+    ).join('\n    ')}
+    <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+</Types>`);
+
+            // Main relationships
+            zip.file('_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>`);
+
+            // Presentation XML
+            zip.file('ppt/presentation.xml', generatePresentationXML(slidesStructure));
+            
+            // Presentation relationships
+            zip.file('ppt/_rels/presentation.xml.rels', generatePresentationRels(slidesStructure));
+            
+            // Slides
+            slidesStructure.slides.forEach((slide, index) => {
+                zip.file(`ppt/slides/slide${index + 1}.xml`, generateSlideXML(slide, index + 1));
+                zip.file(`ppt/slides/_rels/slide${index + 1}.xml.rels`, generateSlideRels(index + 1));
+            });
+
+            // Slide Master
+            zip.file('ppt/slideMasters/slideMaster1.xml', generateSlideMasterXML());
+            zip.file('ppt/slideMasters/_rels/slideMaster1.xml.rels', generateSlideMasterRels());
+
+            // Slide Layout
+            zip.file('ppt/slideLayouts/slideLayout1.xml', generateSlideLayoutXML());
+            zip.file('ppt/slideLayouts/_rels/slideLayout1.xml.rels', generateSlideLayoutRels());
+
+            // Theme
+            zip.file('ppt/theme/theme1.xml', generateThemeXML());
+        }
+
+        function generatePresentationXML(slidesStructure) {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:sldMasterIdLst>
+        <p:sldMasterId id="2147483648" r:id="rId1"/>
+    </p:sldMasterIdLst>
+    <p:sldIdLst>
+        ${slidesStructure.slides.map((_, index) => 
+            `<p:sldId id="${2147483649 + index}" r:id="rId${index + 2}"/>`
+        ).join('\n        ')}
+    </p:sldIdLst>
+    <p:sldSz cx="9144000" cy="6858000" type="screen4x3"/>
+    <p:notesSz cx="6858000" cy="9144000"/>
+    <p:defaultTextStyle/>
+</p:presentation>`;
+        }
+
+        function generatePresentationRels(slidesStructure) {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>
+    ${slidesStructure.slides.map((_, index) => 
+        `<Relationship Id="rId${index + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${index + 1}.xml"/>`
+    ).join('\n    ')}
+</Relationships>`;
+        }
+
+        function generateSlideXML(slide, slideIndex) {
+            const contentBullets = Array.isArray(slide.content) 
+                ? slide.content.map(point => `
+                    <a:p>
+                        <a:pPr lvl="0" marL="228600" indent="-228600"/>
+                        <a:r><a:t>${escapeXML(point)}</a:t></a:r>
+                    </a:p>`).join('')
+                : `<a:p><a:r><a:t>${escapeXML(slide.content)}</a:t></a:r></a:p>`;
+
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:cSld>
+        <p:spTree>
+            <p:nvGrpSpPr>
+                <p:cNvPr id="1" name=""/>
+                <p:cNvGrpSpPr/>
+                <p:nvPr/>
+            </p:nvGrpSpPr>
+            <p:grpSpPr>
+                <a:xfrm>
+                    <a:off x="0" y="0"/>
+                    <a:ext cx="0" cy="0"/>
+                    <a:chOff x="0" y="0"/>
+                    <a:chExt cx="0" cy="0"/>
+                </a:xfrm>
+            </p:grpSpPr>
+            <!-- Title Shape -->
+            <p:sp>
+                <p:nvSpPr>
+                    <p:cNvPr id="2" name="Title"/>
+                    <p:cNvSpPr>
+                        <a:spLocks noGrp="1"/>
+                    </p:cNvSpPr>
+                    <p:nvPr>
+                        <p:ph type="title"/>
+                    </p:nvPr>
+                </p:nvSpPr>
+                <p:spPr>
+                    <a:xfrm>
+                        <a:off x="457200" y="274638"/>
+                        <a:ext cx="8229600" cy="1143000"/>
+                    </a:xfrm>
+                    <a:prstGeom prst="rect">
+                        <a:avLst/>
+                    </a:prstGeom>
+                    <a:solidFill>
+                        <a:schemeClr val="bg1"/>
+                    </a:solidFill>
+                </p:spPr>
+                <p:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                        <a:pPr algn="ctr">
+                            <a:defRPr sz="4400" b="1">
+                                <a:solidFill>
+                                    <a:schemeClr val="tx1"/>
+                                </a:solidFill>
+                            </a:defRPr>
+                        </a:pPr>
+                        <a:r>
+                            <a:rPr lang="en-US" sz="4400" b="1">
+                                <a:solidFill>
+                                    <a:schemeClr val="tx1"/>
+                                </a:solidFill>
+                            </a:rPr>
+                            <a:t>${escapeXML(slide.title)}</a:t>
+                        </a:r>
+                    </a:p>
+                </p:txBody>
+            </p:sp>
+            <!-- Content Shape -->
+            <p:sp>
+                <p:nvSpPr>
+                    <p:cNvPr id="3" name="Content"/>
+                    <p:cNvSpPr>
+                        <a:spLocks noGrp="1"/>
+                    </p:cNvSpPr>
+                    <p:nvPr>
+                        <p:ph type="body" idx="1"/>
+                    </p:nvPr>
+                </p:nvSpPr>
+                <p:spPr>
+                    <a:xfrm>
+                        <a:off x="457200" y="1600200"/>
+                        <a:ext cx="8229600" cy="4525963"/>
+                    </a:xfrm>
+                    <a:prstGeom prst="rect">
+                        <a:avLst/>
+                    </a:prstGeom>
+                    <a:solidFill>
+                        <a:schemeClr val="bg1"/>
+                    </a:solidFill>
+                </p:spPr>
+                <p:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    ${contentBullets}
+                </p:txBody>
+            </p:sp>
+        </p:spTree>
+    </p:cSld>
+    <p:clrMapOvr>
+        <a:masterClrMapping/>
+    </p:clrMapOvr>
+</p:sld>`;
+        }
+
+        function generateSlideRels(slideIndex) {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+</Relationships>`;
+        }
+
+        function generateSlideMasterXML() {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:cSld>
+        <p:bg>
+            <p:bgRef idx="1001">
+                <a:schemeClr val="bg1"/>
+            </p:bgRef>
+        </p:bg>
+        <p:spTree>
+            <p:nvGrpSpPr>
+                <p:cNvPr id="1" name=""/>
+                <p:cNvGrpSpPr/>
+                <p:nvPr/>
+            </p:nvGrpSpPr>
+            <p:grpSpPr>
+                <a:xfrm>
+                    <a:off x="0" y="0"/>
+                    <a:ext cx="0" cy="0"/>
+                    <a:chOff x="0" y="0"/>
+                    <a:chExt cx="0" cy="0"/>
+                </a:xfrm>
+            </p:grpSpPr>
+        </p:spTree>
+    </p:cSld>
+    <p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+    <p:sldLayoutIdLst>
+        <p:sldLayoutId id="2147483649" r:id="rId1"/>
+    </p:sldLayoutIdLst>
+    <p:txStyles>
+        <p:titleStyle>
+            <a:lvl1pPr algn="ctr" defTabSz="914400" rtl="0" eaLnBrk="1" latinLnBrk="0" hangingPunct="1">
+                <a:spcBef>
+                    <a:spcPct val="0"/>
+                </a:spcBef>
+                <a:buNone/>
+                <a:defRPr sz="4400" kern="1200">
+                    <a:solidFill>
+                        <a:schemeClr val="tx1"/>
+                    </a:solidFill>
+                    <a:latin typeface="+mj-lt"/>
+                    <a:ea typeface="+mj-ea"/>
+                    <a:cs typeface="+mj-cs"/>
+                </a:defRPr>
+            </a:lvl1pPr>
+        </p:titleStyle>
+        <p:bodyStyle>
+            <a:lvl1pPr marL="342900" indent="-342900" algn="l" defTabSz="914400" rtl="0" eaLnBrk="1" latinLnBrk="0" hangingPunct="1">
+                <a:spcBef>
+                    <a:spcPct val="20000"/>
+                </a:spcBef>
+                <a:buFont typeface="Arial" pitchFamily="34" charset="0"/>
+                <a:buChar char="•"/>
+                <a:defRPr sz="2800" kern="1200">
+                    <a:solidFill>
+                        <a:schemeClr val="tx1"/>
+                    </a:solidFill>
+                    <a:latin typeface="+mn-lt"/>
+                    <a:ea typeface="+mn-ea"/>
+                    <a:cs typeface="+mn-cs"/>
+                </a:defRPr>
+            </a:lvl1pPr>
+        </p:bodyStyle>
+        <p:otherStyle>
+            <a:defPPr>
+                <a:defRPr lang="en-US"/>
+            </a:defPPr>
+        </p:otherStyle>
+    </p:txStyles>
+</p:sldMaster>`;
+        }
+
+        function generateSlideMasterRels() {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>
+</Relationships>`;
+        }
+
+        function generateSlideLayoutXML() {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="titleAndBody" preserve="1">
+    <p:cSld name="Title and Content">
+        <p:spTree>
+            <p:nvGrpSpPr>
+                <p:cNvPr id="1" name=""/>
+                <p:cNvGrpSpPr/>
+                <p:nvPr/>
+            </p:nvGrpSpPr>
+            <p:grpSpPr>
+                <a:xfrm>
+                    <a:off x="0" y="0"/>
+                    <a:ext cx="0" cy="0"/>
+                    <a:chOff x="0" y="0"/>
+                    <a:chExt cx="0" cy="0"/>
+                </a:xfrm>
+            </p:grpSpPr>
+            <p:sp>
+                <p:nvSpPr>
+                    <p:cNvPr id="2" name="Title 1"/>
+                    <p:cNvSpPr>
+                        <a:spLocks noGrp="1"/>
+                    </p:cNvSpPr>
+                    <p:nvPr>
+                        <p:ph type="title"/>
+                    </p:nvPr>
+                </p:nvSpPr>
+                <p:spPr/>
+                <p:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                        <a:endParaRPr lang="en-US"/>
+                    </a:p>
+                </p:txBody>
+            </p:sp>
+            <p:sp>
+                <p:nvSpPr>
+                    <p:cNvPr id="3" name="Content Placeholder 2"/>
+                    <p:cNvSpPr>
+                        <a:spLocks noGrp="1"/>
+                    </p:cNvSpPr>
+                    <p:nvPr>
+                        <p:ph type="body" idx="1"/>
+                    </p:nvPr>
+                </p:nvSpPr>
+                <p:spPr/>
+                <p:txBody>
+                    <a:bodyPr/>
+                    <a:lstStyle/>
+                    <a:p>
+                        <a:pPr lvl="0"/>
+                        <a:endParaRPr lang="en-US"/>
+                    </a:p>
+                </p:txBody>
+            </p:sp>
+        </p:spTree>
+    </p:cSld>
+    <p:clrMapOvr>
+        <a:masterClrMapping/>
+    </p:clrMapOvr>
+</p:sldLayout>`;
+        }
+
+        function generateSlideLayoutRels() {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
+</Relationships>`;
+        }
+
+        function generateThemeXML() {
+            return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
+    <a:themeElements>
+        <a:clrScheme name="Office">
+            <a:dk1>
+                <a:sysClr val="windowText" lastClr="000000"/>
+            </a:dk1>
+            <a:lt1>
+                <a:sysClr val="window" lastClr="FFFFFF"/>
+            </a:lt1>
+            <a:dk2>
+                <a:srgbClr val="44546A"/>
+            </a:dk2>
+            <a:lt2>
+                <a:srgbClr val="E7E6E6"/>
+            </a:lt2>
+            <a:accent1>
+                <a:srgbClr val="4472C4"/>
+            </a:accent1>
+            <a:accent2>
+                <a:srgbClr val="E15759"/>
+            </a:accent2>
+            <a:accent3>
+                <a:srgbClr val="70AD47"/>
+            </a:accent3>
+            <a:accent4>
+                <a:srgbClr val="FFC000"/>
+            </a:accent4>
+            <a:accent5>
+                <a:srgbClr val="5B9BD5"/>
+            </a:accent5>
+            <a:accent6>
+                <a:srgbClr val="C1C1C1"/>
+            </a:accent6>
+            <a:hlink>
+                <a:srgbClr val="0563C1"/>
+            </a:hlink>
+            <a:folHlink>
+                <a:srgbClr val="954F72"/>
+            </a:folHlink>
+        </a:clrScheme>
+        <a:fontScheme name="Office">
+            <a:majorFont>
+                <a:latin typeface="Calibri Light" panose="020F0302020204030204"/>
+                <a:ea typeface=""/>
+                <a:cs typeface=""/>
+            </a:majorFont>
+            <a:minorFont>
+                <a:latin typeface="Calibri" panose="020F0502020204030204"/>
+                <a:ea typeface=""/>
+                <a:cs typeface=""/>
+            </a:minorFont>
+        </a:fontScheme>
+        <a:fmtScheme name="Office">
+            <a:fillStyleLst>
+                <a:solidFill>
+                    <a:schemeClr val="phClr"/>
+                </a:solidFill>
+                <a:gradFill rotWithShape="1">
+                    <a:gsLst>
+                        <a:gs pos="0">
+                            <a:schemeClr val="phClr">
+                                <a:lumMod val="110000"/>
+                                <a:satMod val="105000"/>
+                                <a:tint val="67000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                        <a:gs pos="50000">
+                            <a:schemeClr val="phClr">
+                                <a:lumMod val="105000"/>
+                                <a:satMod val="103000"/>
+                                <a:tint val="73000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                        <a:gs pos="100000">
+                            <a:schemeClr val="phClr">
+                                <a:lumMod val="105000"/>
+                                <a:satMod val="109000"/>
+                                <a:tint val="81000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                    </a:gsLst>
+                    <a:lin ang="5400000" scaled="0"/>
+                </a:gradFill>
+                <a:gradFill rotWithShape="1">
+                    <a:gsLst>
+                        <a:gs pos="0">
+                            <a:schemeClr val="phClr">
+                                <a:satMod val="103000"/>
+                                <a:lumMod val="102000"/>
+                                <a:tint val="94000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                        <a:gs pos="50000">
+                            <a:schemeClr val="phClr">
+                                <a:satMod val="110000"/>
+                                <a:lumMod val="100000"/>
+                                <a:shade val="100000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                        <a:gs pos="100000">
+                            <a:schemeClr val="phClr">
+                                <a:lumMod val="99000"/>
+                                <a:satMod val="120000"/>
+                                <a:shade val="78000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                    </a:gsLst>
+                    <a:lin ang="5400000" scaled="0"/>
+                </a:gradFill>
+            </a:fillStyleLst>
+            <a:lnStyleLst>
+                <a:ln w="6350" cap="flat" cmpd="sng" algn="ctr">
+                    <a:solidFill>
+                        <a:schemeClr val="phClr"/>
+                    </a:solidFill>
+                    <a:prstDash val="solid"/>
+                    <a:miter lim="800000"/>
+                </a:ln>
+                <a:ln w="12700" cap="flat" cmpd="sng" algn="ctr">
+                    <a:solidFill>
+                        <a:schemeClr val="phClr"/>
+                    </a:solidFill>
+                    <a:prstDash val="solid"/>
+                    <a:miter lim="800000"/>
+                </a:ln>
+                <a:ln w="19050" cap="flat" cmpd="sng" algn="ctr">
+                    <a:solidFill>
+                        <a:schemeClr val="phClr"/>
+                    </a:solidFill>
+                    <a:prstDash val="solid"/>
+                    <a:miter lim="800000"/>
+                </a:ln>
+            </a:lnStyleLst>
+            <a:effectStyleLst>
+                <a:effectStyle>
+                    <a:effectLst/>
+                </a:effectStyle>
+                <a:effectStyle>
+                    <a:effectLst/>
+                </a:effectStyle>
+                <a:effectStyle>
+                    <a:effectLst>
+                        <a:outerShdw blurRad="57150" dist="19050" dir="5400000" algn="ctr" rotWithShape="0">
+                            <a:srgbClr val="000000">
+                                <a:alpha val="63000"/>
+                            </a:srgbClr>
+                        </a:outerShdw>
+                    </a:effectLst>
+                </a:effectStyle>
+            </a:effectStyleLst>
+            <a:bgFillStyleLst>
+                <a:solidFill>
+                    <a:schemeClr val="phClr"/>
+                </a:solidFill>
+                <a:solidFill>
+                    <a:schemeClr val="phClr">
+                        <a:tint val="95000"/>
+                        <a:satMod val="170000"/>
+                    </a:schemeClr>
+                </a:solidFill>
+                <a:gradFill rotWithShape="1">
+                    <a:gsLst>
+                        <a:gs pos="0">
+                            <a:schemeClr val="phClr">
+                                <a:tint val="93000"/>
+                                <a:satMod val="150000"/>
+                                <a:shade val="98000"/>
+                                <a:lumMod val="102000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                        <a:gs pos="50000">
+                            <a:schemeClr val="phClr">
+                                <a:tint val="98000"/>
+                                <a:satMod val="130000"/>
+                                <a:shade val="90000"/>
+                                <a:lumMod val="103000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                        <a:gs pos="100000">
+                            <a:schemeClr val="phClr">
+                                <a:shade val="63000"/>
+                                <a:satMod val="120000"/>
+                            </a:schemeClr>
+                        </a:gs>
+                    </a:gsLst>
+                    <a:lin ang="5400000" scaled="0"/>
+                </a:gradFill>
+            </a:bgFillStyleLst>
+        </a:fmtScheme>
+    </a:themeElements>
+    <a:objectDefaults/>
+    <a:extraClrSchemeLst/>
+    <a:extLst>
+        <a:ext uri="{05A4C25C-085E-4340-85A3-A5531E510DB2}">
+            <thm15:themeFamily xmlns:thm15="http://schemas.microsoft.com/office/thememl/2012/main" name="Office Theme" id="{62F939B6-93AF-4DB8-9C6B-D6C7DFDC589F}" vid="{4A3C46E8-61CC-4603-A589-7422A47A8E4A}"/>
+        </a:ext>
+    </a:extLst>
+</a:theme>`;
+        }
+
+        function escapeXML(text) {
+            if (!text) return '';
+            return text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&apos;');
+        }
+
         function showProgress(message) {
             document.getElementById('progressContainer').style.display = 'block';
             document.getElementById('progressText').textContent = message;
@@ -645,6 +1291,7 @@
         // Add some sample text for demo
         document.addEventListener('DOMContentLoaded', function() {
             const sampleText = ``;
+
             document.getElementById('inputText').value = sampleText;
         });
     </script>
